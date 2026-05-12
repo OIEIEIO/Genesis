@@ -197,7 +197,11 @@ class Viewer(pyglet.window.Window):
             viewport_size = (640, 480)
         self.gs_context = context
         self._scene = context._scene
+        # ``_viewport_size`` tracks the current window content area and follows ``on_resize`` (the OS may
+        # clamp the window to a smaller area than requested); ``_offscreen_viewport_size`` keeps the size the
+        # caller asked for so the offscreen renderer can always honor it regardless of window clamping.
         self._viewport_size = viewport_size
+        self._offscreen_viewport_size = viewport_size
         self._render_lock = RLock()
         self._initialized_event = Event()
         self._is_active = False
@@ -745,12 +749,19 @@ class Viewer(pyglet.window.Window):
                 # Update context, just in case is not already done before
                 self.gs_context.update()
 
-                # Render current frame from camera viewpoint
+                # Render current frame from camera viewpoint. Force the renderer back to the originally
+                # requested viewport size so the offscreen FBO honors what the caller asked for even when the
+                # window has since been clamped to a smaller content area by the OS (e.g. macOS CI runners).
                 self._offscreen_results = []
                 self.render_flags["offscreen"] = True
                 self.render_flags["skip_markers"] = skip_markers
-                self.clear()
-                retval = self._render(camera, target, normal)
+                saved_viewport = (target.viewport_width, target.viewport_height)
+                target.viewport_width, target.viewport_height = self._offscreen_viewport_size
+                try:
+                    self.clear()
+                    retval = self._render(camera, target, normal)
+                finally:
+                    target.viewport_width, target.viewport_height = saved_viewport
                 self._offscreen_result = retval if retval else (None, None)
                 self.render_flags["offscreen"] = False
                 self.render_flags["skip_markers"] = False
@@ -1083,6 +1094,7 @@ class Viewer(pyglet.window.Window):
 
     def start(self, auto_refresh=True):
         import pyglet  # For some reason, this is necessary if 'pyglet.window.xlib' fails to import...
+        import pyglet.app
 
         try:
             import pyglet.display.xlib
@@ -1091,6 +1103,12 @@ class Viewer(pyglet.window.Window):
             xlib_exceptions = (pyglet.window.xlib.XlibException, pyglet.display.xlib.NoSuchDisplayException)
         except ImportError:
             xlib_exceptions = ()
+
+        # Pyglet's Win32EventLoop captures the thread that first instantiates it and refuses ``dispatch_events``
+        # from any other thread. Mixing ``run_in_thread=True`` and ``run_in_thread=False`` viewers in the same
+        # Python process (typical in unit tests) leaves a stale thread id behind. Recreate the platform event
+        # loop here so its constructor rebinds the dispatch thread to whoever is about to call us.
+        pyglet.app.platform_event_loop = pyglet.app.PlatformEventLoop()
 
         # Try multiple configs starting with target OpenGL version and multisampling enabled, then removing these
         # options if not supported.
