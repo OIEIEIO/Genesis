@@ -1185,7 +1185,7 @@ def kernel_update_vgeoms(
     static_rigid_sim_config: qd.template(),
 ):
     """
-    Vgeoms are only for visualization purposes.
+    Vgeoms are only for visualization purposes. Updates vgeom world transforms from link state.
     """
     n_vgeoms = vgeoms_info.link_idx.shape[0]
     _B = links_state.pos.shape[1]
@@ -1196,6 +1196,36 @@ def kernel_update_vgeoms(
         vgeoms_state.pos[i_g, i_b], vgeoms_state.quat[i_g, i_b] = gu.qd_transform_pos_quat_by_trans_quat(
             vgeoms_info.pos[i_g], vgeoms_info.quat[i_g], links_state.pos[i_l, i_b], links_state.quat[i_l, i_b]
         )
+
+
+@qd.kernel(fastcache=True)
+def kernel_update_vverts_for_vgeoms(
+    vgeoms_idx: qd.types.ndarray(),
+    vgeoms_info: array_class.VGeomsInfo,
+    vgeoms_state: array_class.VGeomsState,
+    vverts_info: array_class.VVertsInfo,
+    vverts_state: array_class.VVertsState,
+    static_rigid_sim_config: qd.template(),
+):
+    """
+    Refresh vverts_state.pos for the requested vgeom range from FK output. Only iterates vverts that have a slot in
+    the custom buffer (vverts_state_idx != -1); other vverts are computed on the fly by their consumers, so they have
+    no persistent storage here.
+    """
+    n_vgeoms_in = vgeoms_idx.shape[0]
+    _B = vgeoms_state.pos.shape[1]
+
+    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL))
+    for i_vg_, i_b in qd.ndrange(n_vgeoms_in, _B):
+        i_vg = vgeoms_idx[i_vg_]
+        v_start = vgeoms_info.vvert_start[i_vg]
+        v_end = vgeoms_info.vvert_end[i_vg]
+        for i_vv in range(v_start, v_end):
+            i_state = vverts_info.vverts_state_idx[i_vv]
+            if i_state >= 0:
+                vverts_state.pos[i_state, i_b] = gu.qd_transform_by_trans_quat(
+                    vverts_info.init_pos[i_vv], vgeoms_state.pos[i_vg, i_b], vgeoms_state.quat[i_vg, i_b]
+                )
 
 
 @qd.func

@@ -80,6 +80,8 @@ class KinematicEntity(Entity):
         vgeom_start: int,
         vvert_start: int,
         vface_start: int,
+        custom_vvert_start: int,
+        custom_vface_start: int,
         morph_heterogeneous: list[Morph] | None = None,
         name: str | None = None,
     ):
@@ -97,6 +99,8 @@ class KinematicEntity(Entity):
         self._vgeom_start = vgeom_start
         self._vvert_start = vvert_start
         self._vface_start = vface_start
+        self._custom_vvert_start = custom_vvert_start
+        self._custom_vface_start = custom_vface_start
 
         self._is_built: bool = False
         self._is_attached: bool = False
@@ -1916,6 +1920,52 @@ class KinematicEntity(Entity):
             return self._vgeoms
         return gs.List(vgeom for link in self._links for vgeom in link.vgeoms)
 
+    @gs.assert_built
+    def set_vverts(self, vverts, envs_idx=None):
+        """Override this entity's visual vertex positions for rendering and sensors.
+
+        vverts is broadcast to (len(envs_idx), n_vverts, 3); scalars, (3,) and (n_vverts, 3) are accepted. vverts=None
+        re-runs FK over the entity's vgeoms and writes the result back into the custom buffer. Requires the entity's
+        morph to be created with enable_custom_vverts=True.
+        """
+        if self._enable_heterogeneous:
+            gs.raise_exception("This method is not supported by heterogeneous entities.")
+        if not self._morph.enable_custom_vverts:
+            gs.raise_exception(
+                "'set_vverts' requires the entity's morph to be created with 'enable_custom_vverts=True'."
+            )
+        self._solver.set_vverts(
+            self._custom_vvert_start,
+            self._custom_vvert_start + self.n_vverts,
+            np.array([vg.idx for vg in self.vgeoms], dtype=gs.np_int),
+            vverts,
+            envs_idx,
+        )
+
+    @gs.assert_built
+    def get_vverts(self, envs_idx=None):
+        """Return a copy of this entity's visual vertex positions in world space.
+
+        For entities created with enable_custom_vverts=True the positions are read from the engine custom buffer; for
+        other entities they are computed on the fly from each vgeom's current pose applied to its rest-pose init_vverts.
+        """
+        if self._enable_heterogeneous:
+            gs.raise_exception("This method is not supported by heterogeneous entities.")
+        if self._morph.enable_custom_vverts:
+            return self._solver.get_vverts(self._custom_vvert_start, self._custom_vvert_start + self.n_vverts, envs_idx)
+
+        self._solver.update_vgeoms()
+        vgeoms_pos = qd_to_torch(self._solver.vgeoms_state.pos, envs_idx, transpose=True, copy=None)
+        vgeoms_quat = qd_to_torch(self._solver.vgeoms_state.quat, envs_idx, transpose=True, copy=None)
+        parts = []
+        for vgeom in self.vgeoms:
+            init = torch.as_tensor(vgeom.init_vverts, dtype=gs.tc_float, device=gs.device)
+            pos = vgeoms_pos[..., vgeom.idx, :].unsqueeze(-2)
+            quat = vgeoms_quat[..., vgeom.idx, :].unsqueeze(-2)
+            parts.append(gu.transform_by_trans_quat(init, pos, quat))
+        tensor = torch.cat(parts, dim=-2)
+        return tensor[0] if self._solver.n_envs == 0 else tensor
+
     @property
     def links(self) -> list[RigidLink]:
         """The list of links (`RigidLink`) in the entity."""
@@ -1977,6 +2027,8 @@ class RigidEntity(KinematicEntity):
         vgeom_start=0,
         vvert_start=0,
         vface_start=0,
+        custom_vvert_start=0,
+        custom_vface_start=0,
         equality_start=0,
         visualize_contact: bool = False,
         morph_heterogeneous: list[Morph] | None = None,
@@ -2011,6 +2063,8 @@ class RigidEntity(KinematicEntity):
             vgeom_start,
             vvert_start,
             vface_start,
+            custom_vvert_start,
+            custom_vface_start,
             morph_heterogeneous,
             name,
         )

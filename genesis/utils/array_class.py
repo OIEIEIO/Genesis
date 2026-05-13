@@ -1837,6 +1837,7 @@ class VVertsInfo:
     init_pos: qd.Tensor
     init_vnormal: qd.Tensor
     vgeom_idx: qd.Tensor
+    vverts_state_idx: qd.Tensor
 
 
 def get_vverts_info(solver):
@@ -1846,6 +1847,26 @@ def get_vverts_info(solver):
         init_pos=V(dtype=gs.qd_vec3, shape=shape),
         init_vnormal=V(dtype=gs.qd_vec3, shape=shape),
         vgeom_idx=V(dtype=gs.qd_int, shape=shape),
+        vverts_state_idx=V(dtype=gs.qd_int, shape=shape),
+    )
+
+
+# =========================================== VVertsState ===========================================
+
+
+@dataclasses.dataclass(eq=True, kw_only=False, frozen=True)
+class VVertsState:
+    pos: qd.Tensor
+
+
+def get_vverts_state(solver):
+    if math.prod((solver.n_custom_vverts_, solver._B, 3)) > np.iinfo(np.int32).max:
+        gs.raise_exception(
+            f"Custom-vverts state shape (n_custom_vverts={solver.n_custom_vverts_}, B={solver._B}, 3) is too large. "
+            "Consider opting fewer kinematic entities into 'enable_custom_vverts=True', or reducing 'n_envs'."
+        )
+    return VVertsState(
+        pos=V(dtype=gs.qd_vec3, shape=(solver.n_custom_vverts_, solver._B)),
     )
 
 
@@ -2076,6 +2097,7 @@ class DataManager:
         self.entities_state = get_entities_state(solver)
 
         self.vverts_info = get_vverts_info(solver)
+        self.vverts_state = get_vverts_state(solver)
         self.vfaces_info = get_vfaces_info(solver)
 
         self.vgeoms_info = get_vgeoms_info(solver)
