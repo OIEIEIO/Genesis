@@ -10,6 +10,7 @@ import torch
 
 import genesis as gs
 import genesis.utils.geom as gu
+from genesis.utils.misc import tensor_to_array
 
 from .utils import assert_allclose, assert_equal
 
@@ -821,6 +822,126 @@ def test_raycaster_hits(show_viewer, n_envs):
     grid_distances_ref[(..., *hit_ij)] = RAYCAST_HEIGHT - BOX_SIZE
     grid_distances_ref += offset[..., 2].reshape((*(-1 for e in batch_shape), 1, 1))
     assert_allclose(grid_distances, grid_distances_ref, tol=1e-3)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_raycaster_against_visual(tmp_path, show_viewer, n_envs):
+    # Two depth cameras, one per opt-in entity:
+    #   - cam_kin -> KinematicEntity sphere (use_visual_raycasting=True by default). set_vverts overrides survive
+    #     step() so the depth camera reads the user-driven positions, and set_vverts(None) hands control back to FK.
+    #   - cam_rigid -> RigidEntity whose visual mesh (sphere radius 0.2) is intentionally different from its collision
+    #     mesh (capsule radius 0.05). With use_visual_raycasting=True the depth must match the visual sphere.
+    urdf_path = tmp_path / "vis_diff.urdf"
+    urdf_path.write_text(
+        textwrap.dedent(
+            """
+            <robot name="vis_diff">
+                <link name="root">
+                    <visual>
+                        <origin rpy="0 0 0" xyz="0 0 0"/>
+                        <geometry>
+                            <sphere radius="0.2"/>
+                        </geometry>
+                    </visual>
+                    <collision>
+                        <origin rpy="0 0 0" xyz="0 0 0"/>
+                        <geometry>
+                            <capsule radius="0.05" length="0.05"/>
+                        </geometry>
+                    </collision>
+                </link>
+            </robot>
+            """
+        )
+    )
+
+    scene = gs.Scene(
+        profiling_options=gs.options.ProfilingOptions(
+            show_FPS=False,
+        ),
+        show_viewer=show_viewer,
+    )
+    plane = scene.add_entity(gs.morphs.Plane())
+    kin_sphere = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file="meshes/sphere.obj",
+            scale=0.2,
+            pos=(0.0, 0.0, 0.5),
+            fixed=True,
+            enable_custom_vverts=True,
+        ),
+        material=gs.materials.Kinematic(),
+    )
+    scene.add_entity(
+        morph=gs.morphs.URDF(
+            file=str(urdf_path),
+            pos=(0.0, 0.0, 1.5),
+            fixed=True,
+        ),
+        material=gs.materials.Rigid(use_visual_raycasting=True),
+    )
+    cam_kin = scene.add_sensor(
+        gs.sensors.DepthCamera(
+            pattern=gs.sensors.DepthCameraPattern(
+                res=(40, 30),
+                fov_horizontal=30.0,
+            ),
+            entity_idx=plane.idx,
+            link_idx_local=0,
+            pos_offset=(-1.0, 0.0, 0.5),
+            euler_offset=(0.0, 0.0, 0.0),
+            max_range=5.0,
+            return_world_frame=True,
+        ),
+    )
+    cam_rigid = scene.add_sensor(
+        gs.sensors.DepthCamera(
+            pattern=gs.sensors.DepthCameraPattern(
+                res=(40, 30),
+                fov_horizontal=30.0,
+            ),
+            entity_idx=plane.idx,
+            link_idx_local=0,
+            pos_offset=(-1.0, 0.0, 1.5),
+            euler_offset=(0.0, 0.0, 0.0),
+            max_range=5.0,
+            return_world_frame=True,
+        ),
+    )
+    if n_envs > 0:
+        scene.build(n_envs=n_envs)
+    else:
+        scene.build()
+    scene.step()
+
+    # Each camera at x=-1 along its own z-row looks along +x. The center pixel hits the closest point of its target
+    # sphere at x=-0.2 -> depth 0.8. For cam_rigid this comes from the visual BVH (not the collision capsule).
+    assert_allclose(cam_kin.read_image()[..., 15, 20], 0.8, tol=1e-2)
+    assert_allclose(cam_rigid.read_image()[..., 15, 20], 0.8, tol=1e-2)
+
+    # Scale the kinematic sphere by 2x around its center via per-vertex set_vverts. The new radius is 0.4, so the
+    # closest point becomes x=-0.4 and the depth at the center pixel drops to 0.6. Scaling perturbs each vvert by a
+    # different amount, so only the correct vvert-to-state mapping yields 0.6. cam_rigid is unaffected.
+    fk_vverts = tensor_to_array(kin_sphere.get_vverts())
+    center = np.array([0.0, 0.0, 0.5], dtype=np.float32)
+    kin_sphere.set_vverts((fk_vverts - center) * 2.0 + center)
+    scene.step()
+    assert_allclose(cam_kin.read_image()[..., 15, 20], 0.6, tol=1e-2)
+    assert_allclose(cam_rigid.read_image()[..., 15, 20], 0.8, tol=1e-2)
+
+    # Push the kinematic sphere far away. cam_kin should report no_hit_value at the center pixel; cam_rigid still sees
+    # the rigid visual sphere.
+    kin_sphere.set_vverts((100.0, 100.0, 100.0))
+    scene.step()
+    assert_allclose(cam_kin.read_image()[..., 15, 20], 5.0, tol=gs.EPS)
+    assert_allclose(cam_rigid.read_image()[..., 15, 20], 0.8, tol=1e-2)
+
+    # Restoring FK control returns the original hit distance on cam_kin; cam_rigid stays put.
+    kin_sphere.set_vverts(None)
+    scene.step()
+    assert_allclose(cam_kin.read_image()[..., 15, 20], 0.8, tol=1e-2)
+    assert_allclose(cam_rigid.read_image()[..., 15, 20], 0.8, tol=1e-2)
 
 
 @pytest.mark.required
