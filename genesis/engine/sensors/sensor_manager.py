@@ -10,10 +10,12 @@ from genesis.options.sensors import types as _sensor_types_namespace
 from genesis.options.sensors.options import SensorOptions
 from genesis.utils.ring_buffer import TensorRingBuffer
 
+from .base_sensor import SharedSensorMetadata
+
 if TYPE_CHECKING:
     from genesis.vis.rasterizer_context import RasterizerContext
 
-    from .base_sensor import Sensor, SharedSensorMetadata
+    from .base_sensor import Sensor
 
 
 class SensorManager:
@@ -26,13 +28,16 @@ class SensorManager:
         self._sensors_metadata: dict[type["Sensor"], SharedSensorMetadata | None] = {}
         self._ground_truth_cache: dict[type[torch.dtype], torch.Tensor] = {}
         self._cache: dict[type[torch.dtype], torch.Tensor] = {}
-        self._gt_timeline_ring: dict[type[torch.dtype], TensorRingBuffer] = {}
+        self._ground_truth_timeline_ring: dict[type[torch.dtype], TensorRingBuffer] = {}
+        # Pre-delay instantaneous measured timeline; shares ring idx with _ground_truth_timeline_ring per dtype.
+        self._measured_timeline_ring: dict[type[torch.dtype], TensorRingBuffer] = {}
         self._measured_history_ring: dict[type[torch.dtype], TensorRingBuffer] = {}
         # Linearized per-class history of shape (B, max_history_for_class, class_cache_size). Refreshed every step.
         # Lets read_sensors and per-sensor history reads return views instead of re-gathering from the ring.
-        self._linearized_gt_history: dict[type["Sensor"], torch.Tensor] = {}
+        self._linearized_ground_truth_history: dict[type["Sensor"], torch.Tensor] = {}
         self._linearized_measured_history: dict[type["Sensor"], torch.Tensor] = {}
-        # Per-class precomputed history index tensor [0, 1, ..., max_history-1]. Used to fancy-index the rings each step.
+        # Per-class precomputed history index tensor [0, 1, ..., max_history-1]. Used to fancy-index the rings each
+        # step.
         self._hist_idx_by_class: dict[type["Sensor"], torch.Tensor] = {}
         self._cache_slices_by_type: dict[type["Sensor"], slice] = {}
         # (sensor class, entity_idx) -> slice within the class cache. entity_idx == -1 means static sensors.
@@ -149,9 +154,10 @@ class SensorManager:
             }
             self._max_history_by_class[sensor_cls] = cls_max_history
 
-        self._gt_timeline_ring.clear()
+        self._ground_truth_timeline_ring.clear()
+        self._measured_timeline_ring.clear()
         self._measured_history_ring.clear()
-        self._linearized_gt_history.clear()
+        self._linearized_ground_truth_history.clear()
         self._linearized_measured_history.clear()
         self._hist_idx_by_class.clear()
 
@@ -165,7 +171,11 @@ class SensorManager:
             self._cache[dtype] = torch.zeros(cache_shape, dtype=dtype, device=gs.device)
             delay_n = max(delay_depth_per_dtype.get(dtype, 1), 1)
             hist_n = max_history_per_dtype.get(dtype, 0)
-            self._gt_timeline_ring[dtype] = TensorRingBuffer(max(delay_n, hist_n), cache_shape, dtype=dtype)
+            ring_n = max(delay_n, hist_n)
+            self._ground_truth_timeline_ring[dtype] = TensorRingBuffer(ring_n, cache_shape, dtype=dtype)
+            self._measured_timeline_ring[dtype] = TensorRingBuffer(
+                ring_n, cache_shape, dtype=dtype, idx=self._ground_truth_timeline_ring[dtype]._idx
+            )
             if hist_n > 0:
                 self._measured_history_ring[dtype] = TensorRingBuffer(hist_n, cache_shape, dtype=dtype)
 
@@ -177,7 +187,7 @@ class SensorManager:
             cache_slice = self._cache_slices_by_type[sensor_cls]
             cls_size = cache_slice.stop - cache_slice.start
             shape = (self._sim._B, cls_max_history, cls_size)
-            self._linearized_gt_history[sensor_cls] = torch.zeros(shape, dtype=dtype, device=gs.device)
+            self._linearized_ground_truth_history[sensor_cls] = torch.zeros(shape, dtype=dtype, device=gs.device)
             self._linearized_measured_history[sensor_cls] = torch.zeros(shape, dtype=dtype, device=gs.device)
             self._hist_idx_by_class[sensor_cls] = torch.arange(cls_max_history, device=gs.device, dtype=torch.int32)
 
@@ -202,14 +212,15 @@ class SensorManager:
         for dtype in self._ground_truth_cache.keys():
             self._ground_truth_cache[dtype][:, envs_idx] = 0.0
             self._cache[dtype][envs_idx] = 0.0
-            self._gt_timeline_ring[dtype].buffer[:, envs_idx] = 0.0
+            self._ground_truth_timeline_ring[dtype].buffer[:, envs_idx] = 0.0
+            self._measured_timeline_ring[dtype].buffer[:, envs_idx] = 0.0
             if dtype in self._measured_history_ring:
                 self._measured_history_ring[dtype].buffer[:, envs_idx] = 0.0
             for is_ground_truth in (False, True):
                 key = (is_ground_truth, dtype)
                 self._is_last_cache_cloned[key] = False
 
-        for linearized in self._linearized_gt_history.values():
+        for linearized in self._linearized_ground_truth_history.values():
             linearized[envs_idx] = 0.0
         for linearized in self._linearized_measured_history.values():
             linearized[envs_idx] = 0.0
@@ -220,7 +231,7 @@ class SensorManager:
             sensor_cls.reset(self._sensors_metadata[sensor_cls], self._ground_truth_cache[dtype][cache_slice], envs_idx)
 
     def step(self):
-        for ring in self._gt_timeline_ring.values():
+        for ring in self._ground_truth_timeline_ring.values():
             ring.rotate()
         for ring in self._measured_history_ring.values():
             ring.rotate()
@@ -228,16 +239,18 @@ class SensorManager:
         for sensor_cls in self._sensors_by_type.keys():
             dtype = sensor_cls._get_cache_dtype()
             cache_slice = self._cache_slices_by_type[sensor_cls]
-            gt_slice = self._ground_truth_cache[dtype][cache_slice]
-            sensor_cls._update_shared_ground_truth_cache(self._sensors_metadata[sensor_cls], gt_slice)
-            # GT timeline ring write is required: _apply_delay_to_shared_cache reads from the ring even at delay=0,
-            # so even noiseless/no-delay sensor classes need the current frame written each step.
-            self._gt_timeline_ring[dtype][:, cache_slice].set(gt_slice.T)
-            sensor_cls._update_shared_cache(
-                self._sensors_metadata[sensor_cls],
-                gt_slice.T,
+            ground_truth_slice = self._ground_truth_cache[dtype][cache_slice]
+            measured_data_timeline = self._measured_timeline_ring[dtype][:, cache_slice]
+            shared_metadata = self._sensors_metadata[sensor_cls]
+            sensor_cls._update_shared_cache(shared_metadata, ground_truth_slice, measured_data_timeline)
+            # GT timeline ring write is required: history reads access older slots even at delay=0, so the slot
+            # for the current step must be populated independent of the delay sampling that follows.
+            self._ground_truth_timeline_ring[dtype][:, cache_slice].set(ground_truth_slice.T)
+            sensor_cls._apply_delay_to_shared_cache(
+                shared_metadata,
                 self._cache[dtype][:, cache_slice],
-                self._gt_timeline_ring[dtype][:, cache_slice],
+                measured_data_timeline,
+                shared_metadata.interpolate,
             )
             if dtype in self._measured_history_ring:
                 self._measured_history_ring[dtype][:, cache_slice].set(self._cache[dtype][:, cache_slice])
@@ -252,8 +265,8 @@ class SensorManager:
             dtype = sensor_cls._get_cache_dtype()
             cache_slice = self._cache_slices_by_type[sensor_cls]
             hist_idx = self._hist_idx_by_class[sensor_cls]
-            gt_view = self._gt_timeline_ring[dtype].at(hist_idx, slice(None), cache_slice)
-            self._linearized_gt_history[sensor_cls].copy_(gt_view.transpose(0, 1))
+            ground_truth_view = self._ground_truth_timeline_ring[dtype].at(hist_idx, slice(None), cache_slice)
+            self._linearized_ground_truth_history[sensor_cls].copy_(ground_truth_view.transpose(0, 1))
             meas_view = self._measured_history_ring[dtype].at(hist_idx, slice(None), cache_slice)
             self._linearized_measured_history[sensor_cls].copy_(meas_view.transpose(0, 1))
 
@@ -268,7 +281,7 @@ class SensorManager:
         if history_length > 0:
             sensor_cls = type(sensor)
             linearized = (
-                self._linearized_gt_history[sensor_cls]
+                self._linearized_ground_truth_history[sensor_cls]
                 if is_ground_truth
                 else self._linearized_measured_history[sensor_cls]
             )
@@ -347,7 +360,7 @@ class SensorManager:
             cls_max_history = self._max_history_by_class[sensor_cls]
             if cls_max_history > 0:
                 linearized = (
-                    self._linearized_gt_history[sensor_cls]
+                    self._linearized_ground_truth_history[sensor_cls]
                     if is_ground_truth
                     else self._linearized_measured_history[sensor_cls]
                 )
